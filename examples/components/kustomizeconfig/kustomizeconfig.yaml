@@ -24,6 +24,8 @@ nameReference:
   - path: spec/cloudCredentialsRef/secretName
     kind: Subnet
   - path: spec/cloudCredentialsRef/secretName
+    kind: Trunk
+  - path: spec/cloudCredentialsRef/secretName
     kind: KeyPair
 
 - kind: Network
@@ -76,7 +78,13 @@ nameReference:
   - path: spec/resource/portRef
     kind: FloatingIP
   - path: spec/resource/ports[]/portRef
-    kind: Server
+    kind: Server  
+  - path: spec/resource/portRef
+    kind: Trunk
+  - path: spec/resource/subports[]/portRef
+    kind: Trunk
+  - path: spec/import/filter/portRef
+    kind: Trunk
 
 - kind: Project
   fieldSpecs:
@@ -90,3 +98,7 @@ nameReference:
     kind: Port
   - path: spec/resource/projectRef
     kind: SecurityGroup
+  - path: spec/resource/projectRef
+    kind: Trunk
+  - path: spec/import/filter/projectRef
+    kind: Trunk
