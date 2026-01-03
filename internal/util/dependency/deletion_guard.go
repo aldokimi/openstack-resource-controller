@@ -18,6 +18,7 @@ package dependency
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/k-orc/openstack-resource-controller/v2/internal/logging"
@@ -65,6 +66,53 @@ func addDeletionGuard[objTP ObjectType[objT], objT any, depTP ObjectType[depT], 
 
 	dependencyName := ptr.Deref(overrideDependencyName, strings.ToLower(depKind))
 	controllerName := dependencyName + "_deletion_guard_for_" + strings.ToLower(objKind)
+
+	// The checker function is used by the deletion guard registry to determine
+	// whether any dependent objects still reference a given dependency object.
+	// By providing this abstraction, the registry can coordinate among multiple
+	// controllers and ensure that a dependency's finalizer is only removed when it
+	// is no longer in use by any dependents.
+	checker := func(ctx context.Context, k8sClient client.Client, dep client.Object) (hasReferences bool, err error) {
+		// Type assert to the specific dependency type
+		typedDep, ok := dep.(depTP)
+		if !ok {
+			return true, fmt.Errorf("type assertion failed: expected %T, got %T", depSpecimen, dep)
+		}
+
+		refObjects, err := getObjectsFromDep(ctx, k8sClient, typedDep)
+		if err != nil {
+			return true, fmt.Errorf("failed to get objects from dependency: %w", err)
+		}
+
+		// Check if any referring objects exist (excluding owners)
+		depUID := typedDep.GetUID()
+		depOwns := func(obj objTP) bool {
+			owners := obj.GetOwnerReferences()
+			for i := range owners {
+				owner := &owners[i]
+				if owner.Kind == depKind && owner.UID == depUID {
+					return true
+				}
+			}
+			return false
+		}
+
+		for i := range refObjects {
+			refObject := &refObjects[i]
+			if !depOwns(refObject) {
+				// Found a non-owner reference, blocking deletion
+				return true, nil
+			}
+		}
+
+		// No blocking references found
+		return false, nil
+	}
+
+	// Register this guard in the global registry for coordination
+	// Create a logger for this guard using the manager's logger
+	guardLog := mgr.GetLogger().WithName(controllerName)
+	RegisterGuard(finalizer, depKind, checker, guardLog)
 
 	// deletionGuard reconciles the dependency object
 	// If the dependency is marked deleted, we remove the finalizer only when there are no objects referencing it
@@ -118,6 +166,26 @@ func addDeletionGuard[objTP ObjectType[objT], objT any, depTP ObjectType[depT], 
 				log.V(logging.Verbose).Info("Waiting for dependencies", "dependencies", len(refObjects))
 				return ctrl.Result{}, nil
 			}
+		}
+
+		// Before removing the finalizer, check ALL guards that use the same finalizer
+		// for this dependency type to ensure none of them have references.
+		// This coordinates between multiple guards (e.g., port_deletion_guard_for_trunk
+		// and subport_port_deletion_guard_for_trunk) that use the same finalizer.
+		hasRefs, coordErr := CheckAllGuards(ctx, k8sClient, dep, finalizer, depKind)
+		if coordErr != nil {
+			log.Error(coordErr, "Error checking all deletion guards, failing safe (not removing finalizer)")
+			return ctrl.Result{}, coordErr
+		}
+		if hasRefs {
+			log.V(logging.Verbose).Info("Other deletion guard has references, blocking finalizer removal")
+			return ctrl.Result{}, nil
+		}
+
+		// Only remove the finalizer if it exists
+		if !slices.Contains(dep.GetFinalizers(), finalizer) {
+			log.V(logging.Verbose).Info("Finalizer not present, nothing to remove")
+			return ctrl.Result{}, nil
 		}
 
 		log.V(logging.Verbose).Info("Removing finalizer")
